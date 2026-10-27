@@ -51,6 +51,7 @@ use vortex_layout::BufferedBytesTracker;
 use vortex_layout::LayoutContext;
 use vortex_layout::LayoutStrategy;
 use vortex_layout::LayoutWriterContext;
+use vortex_layout::layouts::file_stats::FileStatsSelection;
 use vortex_layout::layouts::file_stats::accumulate_stats;
 use vortex_layout::sequence::SequenceId;
 use vortex_layout::sequence::SequentialStreamAdapter;
@@ -89,7 +90,7 @@ pub struct VortexWriteOptions {
     /// The aggregates to compute for file-level statistics.
     ///
     /// If unset, the writer chooses pruning aggregates from the file dtype.
-    file_statistics: Option<Vec<AggregateFnRef>>,
+    file_statistics: FileStatsSelection,
     write_nested_statistics: bool,
     write_legacy_statistics: bool,
     metadata: HashMap<String, ByteBuffer>,
@@ -113,7 +114,7 @@ impl VortexWriteOptions {
             buffered_bytes: BufferedBytesTracker::new(),
             session,
             exclude_dtype: false,
-            file_statistics: None,
+            file_statistics: FileStatsSelection::new(),
             write_nested_statistics: false,
             write_legacy_statistics: true,
             metadata: HashMap::default(),
@@ -164,13 +165,26 @@ impl VortexWriteOptions {
 
     /// Configure which statistics to compute at the file level.
     ///
-    /// Pass an empty vector to omit file-level statistics. If left unset, the writer chooses
-    /// pruning aggregates from the file dtype.
+    /// Pass an empty vector to omit statistics outside fields configured by
+    /// [`Self::with_field_file_statistics`]. If left unset, each field uses its dtype defaults.
     ///
     /// Like zone maps, file statistics only record aggregates the enabled editions include: the
     /// write fails if this asks for one they don't, while the defaults leave such aggregates out.
     pub fn with_file_statistics(mut self, file_statistics: Vec<AggregateFnRef>) -> Self {
-        self.file_statistics = Some(file_statistics);
+        self.file_statistics = self.file_statistics.with_default(file_statistics);
+        self
+    }
+
+    /// Configure file statistics for a struct field and its descendants.
+    ///
+    /// Deeper paths override shallower paths; repeated paths replace previous selections.
+    /// Invalid paths fail the write. Fields beneath nullable structs record no statistics.
+    pub fn with_field_file_statistics(
+        mut self,
+        path: impl Into<FieldPath>,
+        file_statistics: Vec<AggregateFnRef>,
+    ) -> Self {
+        self.file_statistics = self.file_statistics.with_field(path, file_statistics);
         self
     }
 
@@ -313,12 +327,12 @@ impl VortexWriteOptions {
                 .map(move |result| result.map(|chunk| (ptr.advance(), chunk))),
         )
         .sendable();
-        let omit_statistics = matches!(&self.file_statistics, Some(stats) if stats.is_empty())
+        let omit_statistics = self.file_statistics.is_empty()
             || (!self.write_nested_statistics && !self.write_legacy_statistics);
-        let file_statistics: Option<Arc<[AggregateFnRef]>> = if omit_statistics {
-            Some(Arc::from([]))
+        let file_statistics = if omit_statistics {
+            FileStatsSelection::new().with_default(vec![])
         } else {
-            self.file_statistics.clone().map(Arc::from)
+            self.file_statistics.clone()
         };
         // When unset, `accumulate_stats` resolves each leaf's own default from its dtype, the way
         // `default_zoned_aggregate_fns` does for zoned layouts (e.g. bounded min/max for
