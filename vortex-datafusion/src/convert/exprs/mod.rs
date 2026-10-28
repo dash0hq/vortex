@@ -226,6 +226,52 @@ impl DefaultExpressionConverter {
         Self { session }
     }
 
+    /// Whether the converter can type values of `field`: a natively supported Arrow type, or an
+    /// extension type the session imports, such as `arrow.uuid` over `FixedSizeBinary(16)`.
+    fn supports_field(&self, field: &Field) -> bool {
+        supported_data_types(field.data_type())
+            || (field.extension_type_name().is_some() && self.arrow_dtype(field).is_ok())
+    }
+
+    /// Convert an operand, typing a literal as `literal_field` when one is given.
+    fn convert_operand(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        literal_field: Option<&Field>,
+        schema: &Schema,
+        input_dtype: &DType,
+    ) -> Conversion<Expression> {
+        match (expr.downcast_ref::<df_expr::Literal>(), literal_field) {
+            (Some(literal), Some(field)) => self.convert_literal(expr, literal, field),
+            _ => self.convert_expr(expr, schema, input_dtype),
+        }
+    }
+
+    fn convert_literal(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        literal: &df_expr::Literal,
+        field: &Field,
+    ) -> Conversion<Expression> {
+        let array = literal.value().to_array()?;
+        if array.len() != 1 {
+            return Err(exec_datafusion_err!(
+                "Literal must contain exactly one value, found {}",
+                array.len()
+            )
+            .into());
+        }
+        // Literals of unknown Arrow types stay in DataFusion; conversion failures are errors.
+        self.arrow_dtype(field)?;
+        let scalar = self
+            .session
+            .arrow()
+            .from_arrow_array(array, field)
+            .and_then(|array| array.execute_scalar(0, &mut self.session.create_execution_ctx()))
+            .map_err(|e| exec_datafusion_err!("Failed to convert literal {expr}: {e}"))?;
+        Ok(lit(scalar))
+    }
+
     /// Resolve an Arrow field through the session registry; unknown types are unsupported.
     fn arrow_dtype(&self, field: &Field) -> Conversion<DType> {
         self.session
@@ -290,20 +336,39 @@ impl DefaultExpressionConverter {
             let operator =
                 try_operator_from_df(binary_expr.op()).ok_or(Unconverted::Unsupported)?;
             let boolean_operator = matches!(operator, Operator::And | Operator::Or);
-            let left_type = binary_expr.left().data_type(schema)?;
-            let right_type = binary_expr.right().data_type(schema)?;
+            let left_field = binary_expr.left().return_field(schema)?;
+            let right_field = binary_expr.right().return_field(schema)?;
             if boolean_operator {
-                if left_type != DataType::Boolean || right_type != DataType::Boolean {
+                if left_field.data_type() != &DataType::Boolean
+                    || right_field.data_type() != &DataType::Boolean
+                {
                     return Err(exec_datafusion_err!(
                         "Boolean operator requires Boolean operands: {expr}"
                     )
                     .into());
                 }
-            } else if !supported_data_types(&left_type) || !supported_data_types(&right_type) {
+            }
+            let left_literal_field = adopt_extension(binary_expr.left(), &left_field, &right_field);
+            let right_literal_field =
+                adopt_extension(binary_expr.right(), &right_field, &left_field);
+            if !boolean_operator
+                && (!self.supports_field(left_literal_field.as_deref().unwrap_or(&left_field))
+                    || !self.supports_field(right_literal_field.as_deref().unwrap_or(&right_field)))
+            {
                 return Err(Unconverted::Unsupported);
             }
-            let left = self.convert_expr(binary_expr.left(), schema, input_dtype)?;
-            let right = self.convert_expr(binary_expr.right(), schema, input_dtype)?;
+            let left = self.convert_operand(
+                binary_expr.left(),
+                left_literal_field.as_deref(),
+                schema,
+                input_dtype,
+            )?;
+            let right = self.convert_operand(
+                binary_expr.right(),
+                right_literal_field.as_deref(),
+                schema,
+                input_dtype,
+            )?;
             // DataFusion may evaluate the RHS only on rows selected by the LHS.
             if boolean_operator && !(is_infallible(&left) && is_infallible(&right)) {
                 return Err(Unconverted::Unsupported);
@@ -322,23 +387,7 @@ impl DefaultExpressionConverter {
 
         if let Some(literal) = expr.downcast_ref::<df_expr::Literal>() {
             let field = literal.return_field(schema)?;
-            let array = literal.value().to_array()?;
-            if array.len() != 1 {
-                return Err(exec_datafusion_err!(
-                    "Literal must contain exactly one value, found {}",
-                    array.len()
-                )
-                .into());
-            }
-            // Literals of unknown Arrow types stay in DataFusion; conversion failures are errors.
-            self.arrow_dtype(&field)?;
-            let scalar = self
-                .session
-                .arrow()
-                .from_arrow_array(array, &field)
-                .and_then(|array| array.execute_scalar(0, &mut self.session.create_execution_ctx()))
-                .map_err(|e| exec_datafusion_err!("Failed to convert literal {expr}: {e}"))?;
-            return Ok(lit(scalar));
+            return self.convert_literal(expr, literal, &field);
         }
 
         if let Some(cast_expr) = expr.downcast_ref::<df_expr::CastExpr>() {
@@ -732,4 +781,19 @@ fn array_length_input(scalar_fn: &ScalarFunctionExpr) -> DFResult<Option<&Arc<dy
             "array_length requires one or two arguments"
         )),
     }
+}
+
+/// The field a literal compared with `other` should be typed as: DataFusion strips extension
+/// metadata from literals during type coercion, so a literal with the same Arrow storage type as an
+/// extension-typed operand takes that operand's extension.
+fn adopt_extension(
+    expr: &Arc<dyn PhysicalExpr>,
+    field: &Field,
+    other: &Field,
+) -> Option<Arc<Field>> {
+    (expr.downcast_ref::<df_expr::Literal>().is_some()
+        && field.extension_type_name().is_none()
+        && other.extension_type_name().is_some()
+        && field.data_type() == other.data_type())
+    .then(|| Arc::new(field.clone().with_metadata(other.metadata().clone())))
 }
