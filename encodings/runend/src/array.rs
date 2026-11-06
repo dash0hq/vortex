@@ -581,6 +581,7 @@ mod tests {
     use vortex_array::arrays::DictArray;
     use vortex_array::arrays::ListArray;
     use vortex_array::arrays::ListViewArray;
+    use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::VarBinViewArray;
     use vortex_array::arrays::listview::ListViewArraySlotsExt;
     use vortex_array::assert_arrays_eq;
@@ -590,6 +591,8 @@ mod tests {
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
     use vortex_array::dtype::i256;
+    use vortex_array::expr::lower;
+    use vortex_array::expr::root;
     use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
@@ -602,6 +605,43 @@ mod tests {
         crate::initialize(&session);
         session
     });
+
+    #[test]
+    fn lower_preserves_runs_and_dictionary() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = DictArray::try_new(
+            PrimitiveArray::from_iter([0u8, 1, 2, 0]).into_array(),
+            VarBinViewArray::from_iter_nullable_str([Some("ΟΣ"), None, Some("İȾ")]).into_array(),
+        )?
+        .into_array();
+        let input = RunEnd::try_new_offset_length(
+            PrimitiveArray::from_iter([3u32, 5, 7, 10]).into_array(),
+            values,
+            1,
+            8,
+            &mut ctx,
+        )?
+        .into_array();
+        let result = input
+            .apply(&lower(root()))?
+            .execute_until::<RunEnd>(&mut ctx)?;
+        assert!(result.is::<RunEnd>());
+        assert_arrays_eq!(
+            result,
+            VarBinViewArray::from_iter_nullable_str([
+                Some("ος"),
+                Some("ος"),
+                None,
+                None,
+                Some("i\u{307}ⱦ"),
+                Some("i\u{307}ⱦ"),
+                Some("ος"),
+                Some("ος"),
+            ]),
+            &mut ctx
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_runend_constructor() {
