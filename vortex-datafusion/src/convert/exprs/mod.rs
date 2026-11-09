@@ -518,12 +518,13 @@ impl DefaultExpressionConverter {
         schema: &Schema,
         input_dtype: &DType,
     ) -> Conversion<Expression> {
+        let value_field = in_list.expr().return_field(schema)?;
         if in_list.is_empty()
             || !in_list
                 .list()
                 .iter()
                 .all(|expr| expr.is::<df_expr::Literal>())
-            || !supported_data_types(&in_list.expr().data_type(schema)?)
+            || !self.supports_field(&value_field)
         {
             return Err(Unconverted::Unsupported);
         }
@@ -538,7 +539,10 @@ impl DefaultExpressionConverter {
             .list()
             .iter()
             .map(|element| {
-                let element = self.convert_expr(element, schema, input_dtype)?;
+                let field = element.return_field(schema)?;
+                let literal_field = adopt_extension(element, &field, &value_field);
+                let element =
+                    self.convert_operand(element, literal_field.as_deref(), schema, input_dtype)?;
                 element
                     .as_opt::<Literal>()
                     .cloned()

@@ -319,6 +319,40 @@ fn test_native_in_list(
 }
 
 #[rstest]
+fn test_native_in_list_uuid(
+    #[values(false, true)] negated: bool,
+    #[values(false, true)] with_null: bool,
+) -> anyhow::Result<()> {
+    let mut field = Field::new("id", DataType::FixedSizeBinary(16), true);
+    field.try_with_extension_type(ArrowUuid)?;
+    let schema = Arc::new(Schema::new(vec![field]));
+    let ids = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        [Some([1u8; 16]), Some([5u8; 16]), None],
+        16,
+    )?;
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids)])?;
+    let mut list = (1..=4)
+        .map(|id| {
+            Arc::new(df_expr::Literal::new(ScalarValue::FixedSizeBinary(
+                16,
+                Some(vec![id; 16]),
+            ))) as Arc<dyn PhysicalExpr>
+        })
+        .collect::<Vec<_>>();
+    if with_null {
+        list.push(Arc::new(df_expr::Literal::new(
+            ScalarValue::FixedSizeBinary(16, None),
+        )));
+    }
+    assert_in_list_matches(
+        Arc::new(df_expr::Column::new("id", 0)),
+        list,
+        negated,
+        batch,
+    )
+}
+
+#[rstest]
 #[case::boolean(ScalarValue::Boolean(Some(true)), ScalarValue::Boolean(Some(false)))]
 #[case::unsigned(ScalarValue::UInt64(Some(u64::MAX)), ScalarValue::UInt64(Some(0)))]
 #[case::utf8(ScalarValue::Utf8(Some("a".into())), ScalarValue::Utf8(Some("b".into())))]
