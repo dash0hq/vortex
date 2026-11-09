@@ -329,7 +329,7 @@ fn test_native_in_list_uuid(
     field.try_with_extension_type(ArrowUuid)?;
     let schema = Arc::new(Schema::new(vec![field]));
     let ids = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-        [Some([1u8; 16]), Some([5u8; 16]), None],
+        [Some([1u8; 16]), Some([5u8; 16]), None].into_iter(),
         16,
     )?;
     let batch = RecordBatch::try_new(schema, vec![Arc::new(ids)])?;
