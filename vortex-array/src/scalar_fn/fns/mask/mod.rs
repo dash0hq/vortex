@@ -10,6 +10,7 @@ use vortex_error::vortex_ensure_eq;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+use crate::AnyColumnar;
 use crate::ArrayRef;
 use crate::Canonical;
 use crate::ExecutionCtx;
@@ -24,6 +25,7 @@ use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::expr::BoundExpression;
 use crate::expr::bound;
+use crate::require_input;
 use crate::scalar::Scalar;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
@@ -31,6 +33,7 @@ use crate::scalar_fn::EmptyOptions;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ReduceNode;
 use crate::scalar_fn::ReduceNodeValidity;
+use crate::scalar_fn::ScalarFnExecutionResult;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::ScalarFnVTableExt;
@@ -113,6 +116,20 @@ impl ScalarFnVTable for Mask {
         }
 
         execute_canonical(input, mask_array, ctx)
+    }
+
+    fn execute_step(
+        &self,
+        options: &Self::Options,
+        args: &dyn ExecutionArgs,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ScalarFnExecutionResult> {
+        // A constant mask decides the result without executing the input.
+        if !args.input_matches(1, |mask| mask.is::<Constant>())? {
+            require_input!(args, 0 => AnyColumnar);
+        }
+        self.execute(options, args, ctx)
+            .map(ScalarFnExecutionResult::done)
     }
 
     fn simplify(

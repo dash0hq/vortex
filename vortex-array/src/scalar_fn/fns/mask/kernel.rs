@@ -118,9 +118,11 @@ where
         if child_idx != 0 {
             return Ok(None);
         }
-        let mask_child = parent
-            .nth_child(1)
-            .ok_or_else(|| vortex_err!("Mask expression must have 2 children"))?;
+        // The executor takes the input out of its slot while it executes it, and `nth_child` skips
+        // empty slots.
+        let mask_child = parent.slots()[1]
+            .as_ref()
+            .ok_or_else(|| vortex_err!("Mask expression must have a mask child"))?;
         <V as MaskKernel>::mask(array, mask_child, ctx)
     }
 }

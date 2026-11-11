@@ -206,4 +206,22 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn mask_of_a_slice_stays_run_end() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let array = sliced_runend(buffer![1i32, 2, 3, 4].into_array()).slice(1..6)?;
+        let mask = BoolArray::from_iter([true, true, false, true, true]);
+        let masked = MaskExpr::try_new(array, mask.into_array())?
+            .into_array()
+            .execute_until::<RunEnd>(&mut ctx)?;
+
+        assert!(masked.is::<RunEnd>());
+        assert_arrays_eq!(
+            masked,
+            PrimitiveArray::from_option_iter([Some(1i32), Some(2), None, Some(3), Some(4)]),
+            &mut ctx
+        );
+        Ok(())
+    }
 }
