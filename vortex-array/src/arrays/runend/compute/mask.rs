@@ -3,37 +3,18 @@
 
 //! Masking run-end encoded arrays.
 //!
-//! The output stays run-end encoded. Runs split where the mask changes, and a split run that the
-//! mask hides takes a null value index, so the values array is only gathered, never decoded:
-//!
-//! ```text
-//! Input rows:   A A A | B B
-//! Mask:         1 0 1 | 1 1
-//! Output ends:  1 2 | 5
-//! Value index:  0 null | 0 1   (adjacent hidden runs merge)
-//! ```
-//!
-//! This costs one pass over the mask's true ranges and the runs, independent of the row count.
+//! A run-end array masks as the dictionary it converts to: the mask applies to the run indices,
+//! and the values stay untouched, so scalar functions above the mask still reach them.
 
-use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
-use vortex_mask::AllOr;
 
 use crate::ArrayRef;
 use crate::ArrayView;
 use crate::ExecutionCtx;
 use crate::IntoArray;
-use crate::arrays::ConstantArray;
-use crate::arrays::PrimitiveArray;
 use crate::arrays::runend::RunEnd;
-use crate::arrays::runend::array::RunEndArrayExt;
-use crate::arrays::runend::array::RunEndArraySlotsExt;
-use crate::arrays::runend::iter::slice_relative_ends;
 use crate::builtins::ArrayBuiltins;
-use crate::match_each_unsigned_integer_ptype;
-use crate::scalar::Scalar;
 use crate::scalar_fn::fns::mask::MaskKernel;
-use crate::validity::Validity;
 
 impl MaskKernel for RunEnd {
     fn mask(
@@ -41,97 +22,9 @@ impl MaskKernel for RunEnd {
         mask: &ArrayRef,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let nullable = array.dtype().as_nullable();
-        let keep = Validity::Array(mask.clone()).execute_mask(array.len(), ctx)?;
-        let true_ranges = match keep.slices() {
-            AllOr::All => {
-                // SAFETY: only the values' nullability changes.
-                return Ok(Some(
-                    unsafe {
-                        RunEnd::new_unchecked(
-                            array.ends().clone(),
-                            array.values().cast(nullable)?,
-                            array.offset(),
-                            array.len(),
-                        )
-                    }
-                    .into_array(),
-                ));
-            }
-            AllOr::None => {
-                return Ok(Some(
-                    ConstantArray::new(Scalar::null(nullable), array.len()).into_array(),
-                ));
-            }
-            AllOr::Some(ranges) => ranges,
-        };
-
-        let ends = array.ends().clone().execute::<PrimitiveArray>(ctx)?;
-        let (new_ends, value_indices, kept) =
-            match_each_unsigned_integer_ptype!(ends.ptype(), |E| {
-                split_runs(
-                    slice_relative_ends(ends.as_slice::<E>(), array.offset(), array.len()),
-                    true_ranges,
-                    array.len(),
-                )
-            });
-
-        let indices = PrimitiveArray::new(value_indices.freeze(), Validity::from_iter(kept));
-        let values = array.values().take(indices.into_array())?;
-        // SAFETY: the new ends are strictly increasing, the last is `len`, and there is one value
-        // per end.
-        Ok(Some(
-            unsafe {
-                RunEnd::new_unchecked(
-                    PrimitiveArray::new(new_ends.freeze(), Validity::NonNullable).into_array(),
-                    values,
-                    0,
-                    array.len(),
-                )
-            }
-            .into_array(),
-        ))
+        let dict = array.into_owned().to_dict(ctx)?;
+        Ok(Some(dict.into_array().mask(mask.clone())?))
     }
-}
-
-/// Splits runs at the boundaries of `true_ranges`, returning the new run ends, the value index of
-/// each new run, and whether the mask keeps it. Adjacent hidden runs merge into one.
-fn split_runs(
-    relative_ends: impl Iterator<Item = usize>,
-    true_ranges: &[(usize, usize)],
-    len: usize,
-) -> (BufferMut<u64>, BufferMut<u64>, Vec<bool>) {
-    let mut new_ends = BufferMut::<u64>::empty();
-    let mut value_indices = BufferMut::<u64>::empty();
-    let mut kept = Vec::new();
-    let mut ranges = true_ranges.iter().peekable();
-    let mut pos = 0;
-
-    for (run, run_end) in relative_ends.enumerate() {
-        while pos < run_end {
-            while ranges.next_if(|&&(_, end)| end <= pos).is_some() {}
-            let (segment_end, keep) = match ranges.peek() {
-                Some(&&(start, end)) if start <= pos => (end.min(run_end), true),
-                Some(&&(start, _)) => (start.min(run_end), false),
-                None => (run_end, false),
-            };
-            if !keep
-                && kept.last() == Some(&false)
-                && let Some(last_end) = new_ends.last_mut()
-            {
-                *last_end = segment_end as u64;
-            } else {
-                new_ends.push(segment_end as u64);
-                value_indices.push(run as u64);
-                kept.push(keep);
-            }
-            pos = segment_end;
-        }
-        if pos == len {
-            break;
-        }
-    }
-    (new_ends, value_indices, kept)
 }
 
 #[cfg(test)]
@@ -144,11 +37,12 @@ mod tests {
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::arrays::BoolArray;
+    use crate::arrays::Dict;
     use crate::arrays::DictArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::VarBinViewArray;
+    use crate::arrays::dict::DictArraySlotsExt;
     use crate::arrays::runend::RunEnd;
-    use crate::arrays::runend::array::RunEndArraySlotsExt;
     use crate::arrays::runend::tests::SESSION;
     use crate::assert_arrays_eq;
     use crate::compute::conformance::mask::test_mask_conformance;
@@ -185,38 +79,46 @@ mod tests {
     }
 
     #[test]
-    fn mask_splits_runs_and_merges_hidden_ones() -> VortexResult<()> {
+    fn mask_keeps_run_values_and_masks_codes() -> VortexResult<()> {
         let mut ctx = SESSION.create_execution_ctx();
         let array = sliced_runend(buffer![1i32, 2, 3, 4].into_array());
         let mask = BoolArray::from_iter([true, false, false, false, true, true, true]);
         let masked = MaskExpr::try_new(array, mask.into_array())?
             .into_array()
-            .execute::<ArrayRef>(&mut ctx)?;
+            .execute_until::<Dict>(&mut ctx)?;
 
-        let masked = masked.as_::<RunEnd>();
+        let masked = masked.as_::<Dict>();
         assert_arrays_eq!(
-            masked.ends().clone(),
-            PrimitiveArray::from_iter([1u64, 4, 5, 7]),
+            masked.codes().clone(),
+            PrimitiveArray::from_option_iter([
+                Some(0u64),
+                None,
+                None,
+                None,
+                Some(2),
+                Some(3),
+                Some(3)
+            ]),
             &mut ctx
         );
         assert_arrays_eq!(
             masked.values().clone(),
-            PrimitiveArray::from_option_iter([Some(1i32), None, Some(3), Some(4)]),
+            PrimitiveArray::from_iter([1i32, 2, 3, 4]),
             &mut ctx
         );
         Ok(())
     }
 
     #[test]
-    fn mask_of_a_slice_stays_run_end() -> VortexResult<()> {
+    fn mask_of_a_slice_keeps_run_values() -> VortexResult<()> {
         let mut ctx = SESSION.create_execution_ctx();
         let array = sliced_runend(buffer![1i32, 2, 3, 4].into_array()).slice(1..6)?;
         let mask = BoolArray::from_iter([true, true, false, true, true]);
         let masked = MaskExpr::try_new(array, mask.into_array())?
             .into_array()
-            .execute_until::<RunEnd>(&mut ctx)?;
+            .execute_until::<Dict>(&mut ctx)?;
 
-        assert!(masked.is::<RunEnd>());
+        assert!(masked.is::<Dict>());
         assert_arrays_eq!(
             masked,
             PrimitiveArray::from_option_iter([Some(1i32), Some(2), None, Some(3), Some(4)]),
