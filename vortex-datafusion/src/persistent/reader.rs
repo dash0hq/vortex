@@ -8,8 +8,10 @@ use std::sync::Arc;
 
 use datafusion_common::Result as DFResult;
 use datafusion_datasource::PartitionedFile;
+use futures::future::BoxFuture;
 use object_store::ObjectStore;
 use vortex::array::memory::MemorySessionExt;
+use vortex::file::VortexOpenOptions;
 use vortex::io::VortexReadAt;
 use vortex::io::object_store::ObjectStoreReadAt;
 use vortex::io::session::RuntimeSessionExt;
@@ -32,6 +34,17 @@ pub trait VortexReaderFactory: Debug + Send + Sync + 'static {
         file: &PartitionedFile,
         session: &VortexSession,
     ) -> DFResult<Arc<dyn VortexReadAt>>;
+
+    /// Supply external file metadata, such as an omitted DType, before opening a scan.
+    /// Runs after file pruning and only when no valid parsed footer is cached.
+    fn prepare_open<'a>(
+        &'a self,
+        _file: &'a PartitionedFile,
+        _reader: Arc<dyn VortexReadAt>,
+        options: VortexOpenOptions,
+    ) -> BoxFuture<'a, DFResult<VortexOpenOptions>> {
+        Box::pin(async move { Ok(options) })
+    }
 }
 
 /// Default [`VortexReaderFactory`] backed by DataFusion's [`ObjectStore`].
