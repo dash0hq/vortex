@@ -51,6 +51,7 @@ use vortex::expr::Expression;
 use vortex::expr::and_collect;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::io::InstrumentedReadAt;
+use vortex::io::VortexReadAt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::layout::LayoutReader;
 use vortex::layout::scan::metrics::ScanMetrics;
@@ -211,12 +212,16 @@ impl FileOpener for VortexOpener {
 
         let reader = self.vortex_reader_factory.create_reader(&file, &session)?;
 
-        let reader =
-            InstrumentedReadAt::new_with_labels(reader, metrics_registry.as_ref(), labels.clone());
+        let reader: Arc<dyn VortexReadAt> = Arc::new(InstrumentedReadAt::new_with_labels(
+            reader,
+            metrics_registry.as_ref(),
+            labels.clone(),
+        ));
 
         let mut file_pruning_predicate = self.file_pruning_predicate.clone();
         let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
         let file_metadata_cache = self.file_metadata_cache.clone();
+        let reader_factory = Arc::clone(&self.vortex_reader_factory);
 
         let unified_file_schema = Arc::clone(self.table_schema.file_schema());
         let limit = self.limit;
@@ -300,6 +305,10 @@ impl FileOpener for VortexOpener {
 
             if let Some(footer) = cached_footer {
                 open_opts = open_opts.with_footer(footer);
+            } else {
+                open_opts = reader_factory
+                    .prepare_open(&file, Arc::clone(&reader), open_opts)
+                    .await?;
             }
 
             let vxf = open_opts
