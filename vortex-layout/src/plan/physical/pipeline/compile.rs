@@ -149,10 +149,12 @@ impl Compiler<'_> {
             Some(usize::try_from(rows.start)?..usize::try_from(rows.end)?)
         };
         self.core.segments.push(scan.segment_id());
+        let decode = self.core.decode_slices && slice.is_some();
         Ok(Some(Chain::new(ScanSource::new(
             scan.clone(),
             slice,
             filter,
+            decode,
         ))))
     }
 }

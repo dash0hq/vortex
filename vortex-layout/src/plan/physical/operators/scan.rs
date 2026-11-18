@@ -6,6 +6,8 @@
 use std::ops::Range;
 
 use vortex_array::ArrayRef;
+use vortex_array::Canonical;
+use vortex_array::IntoArray;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::serde::SerializedArray;
 use vortex_error::VortexResult;
@@ -62,6 +64,8 @@ pub(crate) struct ScanSource {
     plan: SegmentScanPlan,
     slice: Option<Range<usize>>,
     filter: Option<Mask>,
+    /// Whether to emit the selected rows in canonical form rather than as an encoded slice.
+    canonical: bool,
     /// The segment to read, until it has been asked for.
     unread: Option<SegmentId>,
     /// The segment has been emitted.
@@ -73,12 +77,14 @@ impl ScanSource {
         plan: SegmentScanPlan,
         slice: Option<Range<usize>>,
         filter: Option<Mask>,
+        canonical: bool,
     ) -> Self {
         Self {
             unread: Some(plan.segment_id()),
             plan,
             slice,
             filter,
+            canonical,
             done: false,
         }
     }
@@ -108,10 +114,12 @@ impl Operator for ScanSource {
             .ok_or_else(|| vortex_err!("Segment scan ran without its bytes"))?;
         self.done = true;
         let array = decode(&self.plan, bytes, cx.session())?;
-        Ok(Step::Final(select(
-            array,
-            self.slice.as_ref(),
-            self.filter.as_ref(),
-        )?))
+        let array = select(array, self.slice.as_ref(), self.filter.as_ref())?;
+        if self.canonical {
+            return Ok(Step::Final(
+                array.execute::<Canonical>(cx.exec())?.into_array(),
+            ));
+        }
+        Ok(Step::Final(array))
     }
 }
