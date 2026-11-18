@@ -23,6 +23,7 @@
 //! that file, like a cached layout reader does for V1 scans.
 
 mod cache;
+mod demand;
 pub(crate) mod io;
 mod retain;
 #[cfg(test)]
@@ -55,6 +56,10 @@ pub use crate::scan::execution::PrunePlanner;
 use crate::scan::execution::ROW_BLOCK_SIZE;
 pub use crate::scan::execution::SegmentLocation;
 use crate::scan::execution::rows_per_chunk;
+use crate::scan::execution::scan_chunks;
+use crate::scan::scan_builder::referenced_field_masks;
+use crate::scan::v2::demand::DemandSegmentSource;
+use crate::scan::v2::demand::field_segments;
 use crate::scan::v2::io::segment_ranges;
 use crate::segments::SegmentSource;
 
@@ -179,6 +184,7 @@ impl ScanBuilder {
     /// wide file is real CPU, so a driver runs this where it runs compute.
     pub fn prepare(self) -> VortexResult<PreparedScan> {
         let file = self.file;
+        let masks = referenced_field_masks(&self.projection, self.filter.as_ref())?;
         let cache = file.cache.unwrap_or_default();
         let root = match cache.root() {
             Some(root) => root,
@@ -240,11 +246,18 @@ impl ScanBuilder {
             None => cache.insert_ranges(segment_ranges(&file.locations)),
         };
         let values = cache.values();
+        let rows = self.row_range.unwrap_or(0..row_count);
+        let chunks = scan_chunks(rows.clone(), chunk_rows);
+        let segments = Arc::new(DemandSegmentSource::new(
+            cache.retaining(file.segments),
+            field_segments(&file.layout, &masks, &chunks)?,
+            filter.is_none() && matches!(self.selection, Selection::All),
+        ));
         Ok(PreparedScan {
             session: self.session,
-            rows: self.row_range.unwrap_or(0..row_count),
+            rows,
             selection: self.selection,
-            segments: cache.retaining(file.segments),
+            segments,
             ranges,
             cache,
             locations: file.locations,
