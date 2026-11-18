@@ -13,6 +13,7 @@ mod file_layout;
 mod file_statistics;
 mod postscript;
 mod segment;
+mod size_splits;
 
 use std::sync::Arc;
 
@@ -27,6 +28,7 @@ use itertools::Itertools;
 pub use segment::*;
 use vortex_array::ArrayId;
 use vortex_array::dtype::DType;
+use vortex_array::dtype::FieldMask;
 use vortex_array::flatbuffers::FlatBuffer;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
@@ -232,6 +234,28 @@ impl Footer {
     /// attribution semantics. No IO is performed.
     pub fn compressed_field_sizes(&self) -> VortexResult<CompressedFieldSizes> {
         CompressedFieldSizes::try_new(&self.root_layout, &self.segments)
+    }
+
+    /// Row boundaries that split a scan of the fields in `field_mask` into splits that each read
+    /// at most `target_bytes` of segments. No IO is performed.
+    ///
+    /// A split reads every chunk of those fields that it overlaps in full, so splitting by size
+    /// bounds what each split holds, and cuts long chunks far less often than splitting at every
+    /// chunk boundary. Splits end at chunk boundaries; where even the nearest boundary exceeds
+    /// `target_bytes`, the split ends there anyway. Pass the result to
+    /// `ScanBuilder::with_natural_splits`.
+    pub fn size_splits(
+        &self,
+        field_mask: &[FieldMask],
+        target_bytes: u64,
+    ) -> VortexResult<Vec<u64>> {
+        size_splits::size_splits(
+            &self.root_layout,
+            &self.segments,
+            self.row_count(),
+            field_mask,
+            target_bytes,
+        )
     }
 
     /// Returns the [`DType`] of the file.

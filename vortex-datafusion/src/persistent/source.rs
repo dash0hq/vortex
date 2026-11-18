@@ -339,6 +339,13 @@ impl VortexSource {
         self
     }
 
+    /// Sets the most bytes of segments one row split of a V1 scan reads; see
+    /// [`VortexTableOptions::split_target_bytes`].
+    pub fn with_split_target_bytes(mut self, split_target_bytes: u64) -> Self {
+        self.options.split_target_bytes = Some(split_target_bytes);
+        self
+    }
+
     /// Returns the effective table options for this source.
     pub fn options(&self) -> &VortexTableOptions {
         &self.options
@@ -394,6 +401,7 @@ impl VortexSource {
             file_metadata_cache: self.file_metadata_cache.clone(),
             projection_pushdown: self.options.projection_pushdown,
             scan_concurrency: self.options.scan_concurrency,
+            split_target_bytes: self.options.split_target_bytes,
             scan_v2: self.options.scan_v2,
             partitions: base_config.file_groups.len(),
         };

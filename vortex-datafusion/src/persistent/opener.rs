@@ -50,6 +50,7 @@ use vortex::array::ArrayRef;
 use vortex::array::VortexSessionExecute;
 use vortex::error::VortexError;
 use vortex::error::VortexExpect;
+use vortex::error::VortexResult;
 use vortex::expr::Expression;
 use vortex::expr::and_collect;
 use vortex::file::OpenOptionsSessionExt;
@@ -57,6 +58,7 @@ use vortex::io::InstrumentedReadAt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::layout::LayoutReader;
 use vortex::layout::scan::scan_builder::ScanBuilder;
+use vortex::layout::scan::scan_builder::referenced_field_masks;
 use vortex::layout::scan::v2::ChunkPlanner;
 use vortex::layout::scan::v2::PrunePlanner;
 use vortex::layout::scan::v2::ScanBuilder as V2ScanBuilder;
@@ -143,6 +145,7 @@ pub(crate) struct VortexOpener {
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     pub projection_pushdown: bool,
     pub scan_concurrency: Option<usize>,
+    pub split_target_bytes: Option<u64>,
     pub scan_v2: bool,
     /// How many partitions the engine runs the scan on, so a V2 scan parallelises inside a
     /// partition only as far as the engine has not.
@@ -230,6 +233,7 @@ impl FileOpener for VortexOpener {
         let file_schemas = Arc::clone(&self.file_schemas);
         let has_output_ordering = self.has_output_ordering;
         let scan_concurrency = self.scan_concurrency;
+        let split_target_bytes = self.split_target_bytes;
         let partitions = self.partitions.max(1);
         let scan_v2 = self.scan_v2;
 
@@ -582,6 +586,15 @@ impl FileOpener for VortexOpener {
                     }
                 };
 
+                let size_split_masks = split_target_bytes
+                    .map(|target| {
+                        referenced_field_masks(&scan_projection, native_filter.as_ref())
+                            .map(|masks| (masks, target))
+                    })
+                    .transpose()
+                    .map_err(|e| {
+                        exec_datafusion_err!("Couldn't find the fields the scan reads: {e}")
+                    })?;
                 let mut scan_builder = ScanBuilder::new(vxf.session().clone(), layout_reader)
                     .with_projection(scan_projection)
                     .with_some_filter(native_filter);
@@ -598,21 +611,26 @@ impl FileOpener for VortexOpener {
                 if let Some(concurrency) = scan_concurrency.filter(|&concurrency| concurrency > 0) {
                     scan_builder = scan_builder.with_concurrency(concurrency);
                 }
-                if let Some(bytes) = byte_range
-                    && (bytes.start != 0 || bytes.end != file.object_meta.size)
-                {
+                let partial_range = byte_range
+                    .filter(|bytes| bytes.start != 0 || bytes.end != file.object_meta.size);
+                if size_split_masks.is_some() || partial_range.is_some() {
                     let splits = natural_splits_for_file(
                         natural_splits.as_ref(),
                         &file.object_meta.location,
-                        &scan_builder,
                         file.object_meta.size,
+                        || match &size_split_masks {
+                            Some((masks, target)) => vxf.footer().size_splits(masks, *target),
+                            None => scan_builder.full_file_splits(),
+                        },
                     )?;
-                    let Some(rows) = split_aligned_row_range(bytes, splits.as_ref()) else {
-                        return Ok(stream::empty().boxed());
-                    };
-                    scan_builder = scan_builder
-                        .with_row_range(rows)
-                        .with_natural_splits(Arc::clone(&splits.row_boundaries));
+                    if let Some(bytes) = partial_range {
+                        let Some(rows) = split_aligned_row_range(bytes, splits.as_ref()) else {
+                            return Ok(stream::empty().boxed());
+                        };
+                        scan_builder = scan_builder.with_row_range(rows);
+                    }
+                    scan_builder =
+                        scan_builder.with_natural_splits(Arc::clone(&splits.row_boundaries));
                 }
                 scan_builder
                     .with_metrics_registry(metrics_registry)
@@ -782,11 +800,14 @@ fn shared_segment_source(
 }
 
 /// Return the cached [`NaturalSplits`] for `path`, computing and caching them on first use.
-fn natural_splits_for_file<A: 'static + Send>(
+///
+/// The boundaries are computed by `compute` for the fields referenced by the scan's projection and
+/// filter, which are fixed for the source's lifetime.
+fn natural_splits_for_file(
     natural_splits: &DashMap<Path, Arc<NaturalSplits>>,
     path: &Path,
-    scan_builder: &ScanBuilder<A>,
     total_size: u64,
+    compute: impl FnOnce() -> VortexResult<Vec<u64>>,
 ) -> DFResult<Arc<NaturalSplits>> {
     if let Some(splits) = natural_splits.get(path) {
         return Ok(Arc::clone(splits.value()));
@@ -798,27 +819,14 @@ fn natural_splits_for_file<A: 'static + Send>(
     match natural_splits.entry(path.clone()) {
         Entry::Occupied(entry) => Ok(Arc::clone(entry.get())),
         Entry::Vacant(entry) => {
-            let splits = compute_natural_splits(scan_builder, total_size)?;
+            let row_boundaries = compute().map_err(|e| {
+                exec_datafusion_err!("Failed to compute Vortex natural splits: {e}")
+            })?;
+            let splits = Arc::new(NaturalSplits::new(row_boundaries.into(), total_size));
             entry.insert(Arc::clone(&splits));
             Ok(splits)
         }
     }
-}
-
-/// Walk the layout tree to compute the file's full natural split boundaries for the fields
-/// referenced by the scan's projection and filter.
-fn compute_natural_splits<A: 'static + Send>(
-    scan_builder: &ScanBuilder<A>,
-    total_size: u64,
-) -> DFResult<Arc<NaturalSplits>> {
-    let row_boundaries = scan_builder
-        .full_file_splits()
-        .map_err(|e| exec_datafusion_err!("Failed to compute Vortex natural splits: {e}"))?;
-
-    Ok(Arc::new(NaturalSplits::new(
-        row_boundaries.into(),
-        total_size,
-    )))
 }
 
 /// Translate a DataFusion byte range to the contiguous natural split ranges it owns.
@@ -1150,6 +1158,36 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_split_target_bytes_sets_the_split_count() -> anyhow::Result<()> {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "splits/file.vortex";
+        let values: Vec<Option<String>> = (0..60_000).map(|i| Some(format!("{i:0100}"))).collect();
+        let batch = record_batch!(("a", Utf8, values)).unwrap();
+        let data_size =
+            write_arrow_to_vortex(Arc::clone(&object_store), file_path, batch.clone()).await?;
+        let file = PartitionedFile::new(file_path.to_string(), data_size);
+        let table_schema = TableSchema::from(batch.schema());
+
+        let mut batch_counts = Vec::new();
+        for target in [0, u64::MAX] {
+            let mut opener = make_opener(Arc::clone(&object_store), table_schema.clone(), None);
+            opener.split_target_bytes = Some(target);
+            opener.has_output_ordering = true;
+            let batches = opener
+                .open(file.clone())?
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+            assert_eq!(concat_batches(&batch.schema(), &batches)?, batch);
+            batch_counts.push(batches.len());
+        }
+        // A zero target splits at every chunk boundary; an unbounded one reads the file whole.
+        assert!(batch_counts[0] > 2, "{batch_counts:?}");
+        assert_eq!(batch_counts[1], 1);
+        Ok(())
+    }
+
     async fn write_arrow_to_vortex(
         object_store: Arc<dyn ObjectStore>,
         path: &str,
@@ -1198,6 +1236,7 @@ mod tests {
             file_metadata_cache: None,
             projection_pushdown: false,
             scan_concurrency: None,
+            split_target_bytes: None,
             scan_v2: false,
         }
     }
@@ -1609,6 +1648,7 @@ mod tests {
             file_metadata_cache: None,
             projection_pushdown: false,
             scan_concurrency: None,
+            split_target_bytes: None,
             scan_v2: false,
         };
 
@@ -1702,6 +1742,7 @@ mod tests {
             file_metadata_cache: None,
             projection_pushdown: false,
             scan_concurrency: None,
+            split_target_bytes: None,
             scan_v2: false,
         };
 
@@ -1886,6 +1927,7 @@ mod tests {
             file_metadata_cache: None,
             projection_pushdown: false,
             scan_concurrency: None,
+            split_target_bytes: None,
             scan_v2: false,
         };
 
@@ -1952,6 +1994,7 @@ mod tests {
             file_metadata_cache: None,
             projection_pushdown: false,
             scan_concurrency: None,
+            split_target_bytes: None,
             scan_v2: false,
         }
     }
@@ -2169,6 +2212,7 @@ mod tests {
             file_metadata_cache: None,
             projection_pushdown: false,
             scan_concurrency: None,
+            split_target_bytes: None,
             scan_v2: false,
         };
 

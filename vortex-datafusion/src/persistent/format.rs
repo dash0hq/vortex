@@ -239,6 +239,13 @@ extensions_options! {
         /// with `SET vortex.scan_concurrency = <n>`, or per table with
         /// `OPTIONS(scan_concurrency '<n>')`.
         pub scan_concurrency: Option<usize>, default = None
+        /// The most bytes of segments one row split of a V1 scan reads.
+        ///
+        /// A split reads every chunk it overlaps in full, so splitting at every chunk boundary
+        /// makes the long chunks of a wide column be read once per split. With a target, a file
+        /// is split only where a split reaches this many bytes of the chunks the scan reads,
+        /// still at chunk boundaries. Leave as `None` to split at every chunk boundary.
+        pub split_target_bytes: Option<u64>, default = None
     }
 }
 
