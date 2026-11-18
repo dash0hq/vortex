@@ -289,6 +289,8 @@ pub(crate) struct Core {
     pub(crate) segments: Vec<SegmentId>,
     /// Whole values kept for later scans of the same split.
     pub(crate) values: ValueCache,
+    /// Whether a scan source reading part of its segment decodes those rows before emitting them.
+    pub(crate) decode_slices: bool,
 }
 
 impl Core {
@@ -308,6 +310,7 @@ impl Core {
             dirty_flags: Vec::new(),
             segments: Vec::new(),
             values: ValueCache::default(),
+            decode_slices: false,
         }
     }
 
@@ -683,6 +686,16 @@ impl Scan {
     /// Shares whole values, such as dictionary values, with the other scans given `values`.
     pub fn with_value_cache(mut self, values: ValueCache) -> Self {
         self.core.values = values;
+        self
+    }
+
+    /// Emits the rows a source reads from part of its segment decoded, not as an encoded slice.
+    ///
+    /// Later stages may cut those rows again, as a pack does at its other fields' batch
+    /// boundaries, and cutting an encoded slice can decode it again each time. Leave this off
+    /// where expressions evaluate on the encoded form, such as filter conjuncts.
+    pub fn with_decoded_slices(mut self, decode_slices: bool) -> Self {
+        self.core.decode_slices = decode_slices;
         self
     }
 

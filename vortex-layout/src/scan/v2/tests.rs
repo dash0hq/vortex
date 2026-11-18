@@ -55,7 +55,6 @@ use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex_session::VortexSession;
 
 use super::ChunkPlanner;
-use super::MAX_ROWS_PER_CHUNK;
 use super::PreparedScan;
 use super::PrunePlanner;
 use super::ROW_BLOCK_SIZE;
@@ -561,17 +560,20 @@ fn smaller_chunks_keep_file_alignment() {
     );
 }
 
-#[tokio::test]
-async fn dictionary_values_are_reused_between_splits() -> VortexResult<()> {
-    let session = new_session().with_tokio();
-    const STORED_CHUNK_ROWS: usize = 70_000;
-    const STORED_CHUNKS: usize = 3;
-    let segments = Arc::new(TestSegments::default());
+/// Rows `0..LONG_STORED_CHUNKS * LONG_STORED_CHUNK_ROWS` as ints, stored in chunks that each span
+/// two work chunks of a projection.
+const LONG_STORED_CHUNK_ROWS: usize = 70_000;
+const LONG_STORED_CHUNKS: usize = 3;
+
+async fn long_stored_ints(
+    session: &VortexSession,
+    segments: &Arc<TestSegments>,
+) -> VortexResult<LayoutRef> {
     let (mut sequence, eof) = SequenceId::root().split();
-    let arrays = (0..STORED_CHUNKS)
+    let arrays = (0..LONG_STORED_CHUNKS)
         .map(|index| {
-            let start = i32::try_from(index * STORED_CHUNK_ROWS)?;
-            let end = start + i32::try_from(STORED_CHUNK_ROWS)?;
+            let start = i32::try_from(index * LONG_STORED_CHUNK_ROWS)?;
+            let end = start + i32::try_from(LONG_STORED_CHUNK_ROWS)?;
             Ok((
                 sequence.advance(),
                 PrimitiveArray::from_iter(start..end).into_array(),
@@ -579,45 +581,34 @@ async fn dictionary_values_are_reused_between_splits() -> VortexResult<()> {
         })
         .collect::<VortexResult<Vec<_>>>()?;
     let dtype = DType::Primitive(vortex_array::dtype::PType::I32, false.into());
-    let ints = chunked_flat()
+    chunked_flat()
         .write_stream(
             ArrayContext::empty().into(),
-            Arc::<TestSegments>::clone(&segments),
+            Arc::<TestSegments>::clone(segments),
             SequentialStreamAdapter::new(dtype, stream::iter(arrays.into_iter().map(Ok)))
                 .sendable(),
             eof,
-            &session,
+            session,
         )
-        .await?;
-    // Codes index the same values across fixed work chunks and stored chunk boundaries.
-    let layout = DictLayout::new(Arc::clone(&ints), ints).into_layout();
+        .await
+}
+
+/// Codes chunks span work chunks, and the values are read once for the whole scan.
+#[tokio::test]
+async fn dictionary_values_are_reused_between_splits() -> VortexResult<()> {
+    let session = new_session().with_tokio();
+    let segments = Arc::new(TestSegments::default());
+    let values = long_stored_ints(&session, &segments).await?;
+    let codes = long_stored_ints(&session, &segments).await?;
+    let layout = DictLayout::new(values, codes).into_layout();
     let counted = Arc::new(CountingSegmentSource::new(segments));
     let segments = Arc::clone(&counted) as Arc<dyn SegmentSource>;
     let mut file = scan_file(&segments, &layout)?;
-    // Without retained segments, so a chunk reads every codes chunk it overlaps.
+    // Without retained segments, so only the scan itself can share a read between chunks.
     file.cache = Some(ScanCache::with_retained_bytes(0));
     let scan = Arc::new(ScanBuilder::new(session.clone(), file).prepare()?);
-    let chunks = row_chunks(scan.rows().clone(), scan.chunk_rows);
-    assert_eq!(
-        chunks.len(),
-        (STORED_CHUNKS * STORED_CHUNK_ROWS).div_ceil(MAX_ROWS_PER_CHUNK)
-    );
-    for (index, rows) in chunks.into_iter().enumerate() {
-        let before = counted.requests();
+    for rows in scan_chunks(scan.rows().clone(), scan.chunk_rows) {
         let arrays = run_rows(&scan, rows.clone()).await?;
-        let reads = counted.requests() - before;
-        let code_chunks =
-            (rows.end - 1) / STORED_CHUNK_ROWS as u64 - rows.start / STORED_CHUNK_ROWS as u64 + 1;
-        // The first chunk reads every values chunk once for the whole scan; its codes are one of
-        // them, and the session shares that read. Later chunks read only their codes.
-        assert_eq!(
-            reads,
-            if index == 0 {
-                STORED_CHUNKS
-            } else {
-                usize::try_from(code_chunks)?
-            }
-        );
         let expected =
             PrimitiveArray::from_iter(i32::try_from(rows.start)?..i32::try_from(rows.end)?);
         assert_arrays_eq!(
@@ -626,39 +617,40 @@ async fn dictionary_values_are_reused_between_splits() -> VortexResult<()> {
             &mut session.create_execution_ctx()
         );
     }
+    assert_eq!(counted.requests(), 2 * LONG_STORED_CHUNKS);
     Ok(())
 }
 
-/// Work chunks that each overlap half of a stored segment read it once while the file's cache
-/// retains segments, and once per chunk when it retains nothing.
+/// Every work chunk overlapping a stored segment takes it from one read, whether or not the
+/// file's cache retains segments.
 #[rstest]
-#[case::retained(None, 1)]
-#[case::not_retained(Some(0), 2)]
+#[case::retained(None)]
+#[case::not_retained(Some(0))]
 #[tokio::test]
 async fn chunks_sharing_a_segment_read_it_once(
     #[case] retained_bytes: Option<u64>,
-    #[case] reads_per_segment: usize,
 ) -> VortexResult<()> {
     let session = new_session().with_tokio();
-    let (segments, layout) = write(&session, chunked_flat().as_ref()).await?;
+    let segments = Arc::new(TestSegments::default());
+    let layout = long_stored_ints(&session, &segments).await?;
     let counted = Arc::new(CountingSegmentSource::new(segments));
     let segments = Arc::clone(&counted) as Arc<dyn SegmentSource>;
     let mut file = scan_file(&segments, &layout)?;
     file.cache =
         Some(retained_bytes.map_or_else(ScanCache::default, ScanCache::with_retained_bytes));
-    let projection = get_item("ints", root()).bind(layout.dtype())?;
-    let mut scan = ScanBuilder::new(session, file)
-        .with_projection(projection)
-        .prepare()?;
-    let chunk_rows = CHUNK_ROWS / 2;
-    scan.chunk_rows = chunk_rows;
-    let scan = Arc::new(scan);
+    let scan = Arc::new(ScanBuilder::new(session, file).prepare()?);
 
     // One chunk at a time, so no read is still in flight when the next chunk starts.
-    for rows in row_chunks(scan.rows().clone(), chunk_rows) {
+    let chunks = scan_chunks(scan.rows().clone(), scan.chunk_rows);
+    assert!(
+        chunks
+            .iter()
+            .any(|rows| rows.end % LONG_STORED_CHUNK_ROWS as u64 != 0)
+    );
+    for rows in chunks {
         run_rows(&scan, rows).await?;
     }
-    assert_eq!(counted.requests(), CHUNKS * reads_per_segment);
+    assert_eq!(counted.requests(), LONG_STORED_CHUNKS);
     Ok(())
 }
 
@@ -1023,6 +1015,8 @@ async fn strings_scan(
     skip_unselective_dynamic: bool,
 ) -> VortexResult<(Arc<PreparedScan>, usize, usize)> {
     let projection = get_item("strings", root()).bind(layout.dtype())?;
+    // An unfiltered scan requests its segments while it is prepared.
+    let before = counted.requests();
     let scan = Arc::new(
         ScanBuilder::new(session.clone(), file)
             .with_projection(projection)
@@ -1030,7 +1024,6 @@ async fn strings_scan(
             .with_skip_unselective_dynamic(skip_unselective_dynamic)
             .prepare()?,
     );
-    let before = counted.requests();
     let rows = run_rows(&scan, scan.rows().clone())
         .await?
         .iter()
