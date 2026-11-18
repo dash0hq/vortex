@@ -124,6 +124,12 @@ impl Compiler<'_> {
         &self.core.session
     }
 
+    /// Whether a source that reads part of its segment should emit those rows decoded, as set by
+    /// [`Scan::with_decoded_slices`](super::Scan::with_decoded_slices).
+    pub fn decoded_slices(&self) -> bool {
+        self.core.decode_slices
+    }
+
     /// Whole values kept between the scans of the split compiling.
     pub(crate) fn values(&self) -> &ValueCache {
         &self.core.values

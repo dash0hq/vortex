@@ -106,10 +106,12 @@ impl PlanVTable for SegmentScan {
             Some(usize::try_from(rows.start)?..usize::try_from(rows.end)?)
         };
         compiler.register_segment(plan.data().segment_id);
+        let canonical = compiler.decoded_slices() && slice.is_some();
         Ok(Some(Chain::new(ScanSource::new(
             plan.clone(),
             slice,
             filter,
+            canonical,
         ))))
     }
 }
