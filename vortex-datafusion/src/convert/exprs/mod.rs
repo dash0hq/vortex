@@ -1071,9 +1071,11 @@ fn try_operator_from_df(value: &DFOperator) -> Option<Operator> {
 fn supported_data_types(dt: &DataType) -> bool {
     use DataType::*;
 
-    // For dictionary types, check if the value type is supported.
-    if let Dictionary(_, value_type) = dt {
-        return supported_data_types(value_type.as_ref());
+    // For dictionary and run-end encoded types, check if the value type is supported.
+    match dt {
+        Dictionary(_, value_type) => return supported_data_types(value_type.as_ref()),
+        RunEndEncoded(_, values) => return supported_data_types(values.data_type()),
+        _ => {}
     }
 
     let is_supported = dt.is_null()

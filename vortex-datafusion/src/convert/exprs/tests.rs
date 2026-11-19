@@ -1166,6 +1166,19 @@ fn test_expr_from_df_array_length(test_schema: Schema) -> DFResult<()> {
     ),
     false
 )]
+// Run-end encoded types - should be supported if value type is supported
+#[case::ree_utf8(ree_utf8(DataType::Int32), true)]
+#[case::ree_unsupported(
+    DataType::RunEndEncoded(
+        Arc::new(Field::new("run_ends", DataType::Int32, false)),
+        Arc::new(Field::new(
+            "values",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true
+        ))
+    ),
+    false
+)]
 fn test_supported_data_types(#[case] data_type: DataType, #[case] expected: bool) {
     assert_eq!(supported_data_types(&data_type), expected);
 }
@@ -1891,13 +1904,24 @@ fn contains_cast(expr: &Expression) -> bool {
 
 /// Plans `predicate` as DataFusion does: type coercion, simplification, then physical planning.
 fn plan_predicate(predicate: &str, schema: &Schema) -> DFResult<Arc<dyn PhysicalExpr>> {
+    let df_schema = DFSchema::try_from(schema.clone())?;
+    plan_expr(
+        SessionContext::new().parse_sql_expr(predicate, &df_schema)?,
+        schema,
+    )
+}
+
+/// Plans a logical `expr` as DataFusion does: type coercion, simplification, then physical planning.
+fn plan_expr(
+    expr: datafusion::logical_expr::Expr,
+    schema: &Schema,
+) -> DFResult<Arc<dyn PhysicalExpr>> {
     let df_schema = Arc::new(DFSchema::try_from(schema.clone())?);
     let simplifier = ExprSimplifier::new(
         SimplifyContext::builder()
             .with_schema(Arc::clone(&df_schema))
             .build(),
     );
-    let expr = SessionContext::new().parse_sql_expr(predicate, &df_schema)?;
     let expr = simplifier.simplify(simplifier.coerce(expr, &df_schema)?)?;
     create_physical_expr(
         &expr,
@@ -2171,6 +2195,110 @@ fn test_ree_dict_comparison_matches_datafusion(#[case] predicate: &str) -> anyho
     )]));
     let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ree)])?;
     assert_native_matches(plan_predicate(predicate, &schema)?, batch)
+}
+
+/// Comparisons on dictionary and run-end encoded columns match DataFusion for each value type that
+/// `supported_data_types` accepts, so the encoding never changes which rows a filter keeps.
+/// Add a value type here when `supported_data_types` starts to accept it.
+#[rstest]
+fn test_encoded_comparison_matches_datafusion(
+    #[values(
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::UInt8,
+        DataType::UInt16,
+        DataType::UInt32,
+        DataType::UInt64,
+        DataType::Float16,
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Decimal128(10, 2),
+        DataType::Decimal256(20, 2),
+        DataType::Boolean,
+        DataType::Date32,
+        DataType::Date64,
+        DataType::Timestamp(ArrowTimeUnit::Nanosecond, None),
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, Some("UTC".into())),
+        DataType::Time32(ArrowTimeUnit::Second),
+        DataType::Time64(ArrowTimeUnit::Nanosecond),
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Utf8View,
+        DataType::Binary,
+        DataType::LargeBinary,
+        DataType::BinaryView
+    )]
+    value_type: DataType,
+    #[values("plain", "dictionary", "ree_int16", "ree_int32", "ree_int64")] encoding: &str,
+) -> anyhow::Result<()> {
+    // DataFusion casts the literal to the column's dictionary type, which Arrow cannot build for
+    // Boolean values, so it cannot plan the comparison.
+    if value_type == DataType::Boolean && encoding == "dictionary" {
+        return Ok(());
+    }
+    let distinct = if value_type.is_string() || value_type.is_binary() {
+        cast(&StringArray::from(vec!["x", "y", "unused"]), &value_type)?
+    } else {
+        let ints = Int64Array::from(vec![0, 1, 2]);
+        cast(&ints, &value_type).or_else(|_| cast(&cast(&ints, &DataType::Int32)?, &value_type))?
+    };
+    // Rows: v0, v0, NULL, v1, v1, v0. The dictionary also holds a value no key references.
+    let dictionary = DictionaryArray::<UInt32Type>::try_new(
+        UInt32Array::from(vec![Some(0), Some(0), None, Some(1), Some(1), Some(0)]),
+        distinct,
+    )?;
+    let plain = cast(&dictionary, &value_type)?;
+    let run_ends = |run_ends: DataType| {
+        cast(
+            &plain,
+            &DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", run_ends, false)),
+                Arc::new(Field::new("values", value_type.clone(), true)),
+            ),
+        )
+    };
+    let encoded = match encoding {
+        "plain" => Arc::clone(&plain),
+        "dictionary" => Arc::new(dictionary) as arrow_array::ArrayRef,
+        "ree_int16" => run_ends(DataType::Int16)?,
+        "ree_int32" => run_ends(DataType::Int32)?,
+        "ree_int64" => run_ends(DataType::Int64)?,
+        _ => unreachable!(),
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "c",
+        encoded.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![encoded])?;
+
+    let first = ScalarValue::try_from_array(&plain, 0)?;
+    let second = ScalarValue::try_from_array(&plain, 3)?;
+    let column = || datafusion::logical_expr::col("c");
+    let literal = |value: &ScalarValue| datafusion::logical_expr::lit(value.clone());
+    for predicate in [
+        column().eq(literal(&first)),
+        column().not_eq(literal(&first)),
+        column().lt(literal(&second)),
+        column().lt_eq(literal(&first)),
+        column().gt(literal(&first)),
+        column().gt_eq(literal(&second)),
+        literal(&first).lt(column()),
+        column().in_list(vec![literal(&second)], false),
+        column().in_list(vec![literal(&first), literal(&second)], false),
+        column().in_list(vec![literal(&first), literal(&second)], true),
+        column()
+            .eq(literal(&first))
+            .and(column().not_eq(literal(&second))),
+        column()
+            .eq(literal(&first))
+            .or(column().eq(literal(&second))),
+    ] {
+        assert_native_matches(plan_expr(predicate, &schema)?, batch.clone())?;
+    }
+    Ok(())
 }
 
 #[rstest]
