@@ -1649,3 +1649,275 @@ mod fixed_superset {
         }
     }
 }
+
+/// Rows of `{a, b, c}`: `a` everywhere, `b` only in row 0, `c` only in row 3.
+fn sparse_struct() -> ArrayRef {
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::StructArray;
+
+    StructArray::from_fields(&[
+        (
+            "a",
+            PrimitiveArray::from_option_iter([Some(1i64), Some(2), Some(3), Some(4)]).into_array(),
+        ),
+        (
+            "b",
+            PrimitiveArray::from_option_iter([Some(10i64), None, None, None]).into_array(),
+        ),
+        (
+            "c",
+            PrimitiveArray::from_option_iter([None, None, None, Some(40i64)]).into_array(),
+        ),
+    ])
+    .map(IntoArray::into_array)
+    .unwrap_or_else(|err| panic!("{err}"))
+}
+
+#[tokio::test]
+async fn presence_index_reads_only_the_fields_the_selected_rows_hold() -> VortexResult<()> {
+    use vortex_array::arrays::StructArray;
+    use vortex_array::assert_arrays_eq;
+    use vortex_array::expr::pack;
+
+    use crate::layouts::indexed::tests::field_presence::FieldPresenceIndex;
+    use crate::layouts::table::TableStrategy;
+
+    let session = new_session();
+    session.indexes().register(FieldPresenceIndex::new_ref());
+    let flat: Arc<dyn LayoutStrategy> = Arc::new(FlatLayoutStrategy::default());
+    let strategy = IndexedStrategy::new(
+        TableStrategy::new(Arc::clone(&flat), Arc::clone(&flat)),
+        FlatLayoutStrategy::default(),
+        vec![IndexConfig::with_defaults(FieldPresenceIndex::new_ref())],
+    );
+    let segments = Arc::new(TestSegments::default());
+    let (ptr, eof) = SequenceId::root().split();
+    let layout = strategy
+        .write_stream(
+            ArrayContext::empty().into(),
+            Arc::<TestSegments>::clone(&segments),
+            sparse_struct().to_array_stream().sequenced(ptr),
+            eof,
+            &session,
+        )
+        .await?;
+
+    let read = async |rows: &[usize], packed: bool| -> VortexResult<(ArrayRef, usize)> {
+        let counting = Arc::new(CountingSegments {
+            inner: Arc::clone(&segments),
+            requested: Mutex::new(Vec::new()),
+        });
+        let reader = layout.new_reader(
+            "attributes".into(),
+            Arc::<CountingSegments>::clone(&counting),
+            &session,
+            &Default::default(),
+        )?;
+        let mask = Mask::from_indices(4, rows.to_vec());
+        let expr = if packed {
+            pack([("s", root())], Nullability::NonNullable).bind(reader.dtype())?
+        } else {
+            BoundExpression::new_root(reader.dtype().clone())
+        };
+        let array = reader
+            .projection_evaluation(&(0..4), &expr, MaskFuture::ready(mask))?
+            .await?;
+        let mut requested = counting.requested.lock().clone();
+        requested.sort();
+        requested.dedup();
+        Ok((array, requested.len()))
+    };
+
+    let mut ctx = session.create_execution_ctx();
+    let expected = |rows: &[usize]| -> VortexResult<ArrayRef> {
+        sparse_struct().filter(Mask::from_indices(4, rows.to_vec()))
+    };
+    let (all, all_segments) = read(&[0, 1, 2, 3], false).await?;
+    assert_arrays_eq!(all, expected(&[0, 1, 2, 3])?, &mut ctx);
+    let (middle, middle_segments) = read(&[1, 2], false).await?;
+    assert_arrays_eq!(middle, expected(&[1, 2])?, &mut ctx);
+    // Rows 1 and 2 hold only `a`, so `b` and `c` are filled with nulls rather than read.
+    assert_eq!(all_segments - middle_segments, 2);
+    let (first, first_segments) = read(&[0, 1], false).await?;
+    assert_arrays_eq!(first, expected(&[0, 1])?, &mut ctx);
+    assert_eq!(all_segments - first_segments, 1);
+    // A scan projecting the whole column wraps it, as `pack(s: $)`, and narrows the same way.
+    let (packed, packed_segments) = read(&[1, 2], true).await?;
+    assert_arrays_eq!(
+        packed,
+        StructArray::from_fields(&[("s", expected(&[1, 2])?)])?,
+        &mut ctx
+    );
+    assert_eq!(packed_segments, middle_segments);
+    Ok(())
+}
+
+/// A test kind recording, per data row, a bitmask of its struct fields that are non-null.
+mod field_presence {
+    use std::sync::Arc;
+
+    use roaring::RoaringBitmap;
+    use vortex_array::ArrayRef;
+    use vortex_array::ExecutionCtx;
+    use vortex_array::IntoArray;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::StructArray;
+    use vortex_array::arrays::struct_::StructArrayExt;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::Nullability::NonNullable;
+    use vortex_array::dtype::PType;
+    use vortex_array::expr::BoundExpression;
+    use vortex_buffer::BitBufferMut;
+    use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
+    use vortex_session::registry::CachedId;
+
+    use crate::layouts::indexed::IndexBuilder;
+    use crate::layouts::indexed::IndexId;
+    use crate::layouts::indexed::IndexQueryPlan;
+    use crate::layouts::indexed::IndexVTable;
+    use crate::layouts::indexed::IndexVTableRef;
+    use crate::layouts::indexed::RowLocator;
+
+    #[derive(Debug)]
+    pub struct FieldPresenceIndex;
+
+    impl FieldPresenceIndex {
+        pub fn new_ref() -> IndexVTableRef {
+            IndexVTableRef::new(Self)
+        }
+    }
+
+    impl IndexVTable for FieldPresenceIndex {
+        type Options = ();
+        type Builder = Builder;
+        type Query = ();
+        type Chunk = Vec<u64>;
+
+        fn id(&self) -> IndexId {
+            static ID: CachedId = CachedId::new("test.idx.field_presence");
+            *ID
+        }
+
+        fn serialize_options(&self, _options: &()) -> Vec<u8> {
+            vec![]
+        }
+
+        fn deserialize_options(&self, _options: &[u8]) -> VortexResult<()> {
+            Ok(())
+        }
+
+        fn index_dtype(&self, dtype: &DType, _options: &()) -> Option<DType> {
+            matches!(dtype, DType::Struct(fields, _) if fields.nfields() <= 64)
+                .then_some(DType::Primitive(PType::U64, NonNullable))
+        }
+
+        fn builder(
+            &self,
+            _dtype: &DType,
+            _options: &(),
+            _data_block_len: Option<u64>,
+            _session: &VortexSession,
+        ) -> VortexResult<Builder> {
+            Ok(Builder(Vec::new()))
+        }
+
+        fn plan(
+            &self,
+            _expr: &BoundExpression,
+            _dtype: &DType,
+            _index_dtype: &DType,
+            _options: &(),
+        ) -> VortexResult<Option<IndexQueryPlan<()>>> {
+            Ok(None)
+        }
+
+        fn encode(
+            &self,
+            chunk: &Vec<u64>,
+            _options: &(),
+            _ctx: &mut ExecutionCtx,
+        ) -> VortexResult<ArrayRef> {
+            Ok(PrimitiveArray::from_iter(chunk.iter().copied()).into_array())
+        }
+
+        fn decode(
+            &self,
+            chunk: ArrayRef,
+            _options: &(),
+            ctx: &mut ExecutionCtx,
+        ) -> VortexResult<Vec<u64>> {
+            Ok(chunk
+                .execute::<PrimitiveArray>(ctx)?
+                .as_slice::<u64>()
+                .to_vec())
+        }
+
+        fn resolve(
+            &self,
+            _query: &(),
+            _chunks: &[Arc<Vec<u64>>],
+            _data_row_count: u64,
+            _options: &(),
+            _ctx: &mut ExecutionCtx,
+        ) -> VortexResult<RowLocator> {
+            unreachable!("plan claims nothing")
+        }
+
+        fn narrows_projections(&self, _dtype: &DType, _options: &()) -> bool {
+            true
+        }
+
+        fn mark_present_fields(
+            &self,
+            chunks: &[Arc<Vec<u64>>],
+            rows: &RoaringBitmap,
+            _options: &(),
+            present: &mut BitBufferMut,
+        ) -> VortexResult<bool> {
+            let masks: Vec<u64> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+            let union = rows.iter().fold(0, |acc, row| acc | masks[row as usize]);
+            for field in 0..present.len() {
+                if union & (1 << field) != 0 {
+                    present.set(field);
+                }
+            }
+            Ok(true)
+        }
+    }
+
+    pub struct Builder(Vec<u64>);
+
+    impl IndexBuilder for Builder {
+        type Options = ();
+        type Chunk = Vec<u64>;
+
+        fn push(
+            &mut self,
+            chunk: &ArrayRef,
+            _row_offset: u64,
+            ctx: &mut ExecutionCtx,
+        ) -> VortexResult<()> {
+            let chunk = chunk.clone().execute::<StructArray>(ctx)?;
+            let mut masks = vec![0u64; chunk.len()];
+            for (field, array) in chunk.iter_unmasked_fields().enumerate() {
+                let valid = array.validity()?.execute_mask(array.len(), ctx)?;
+                for (row, mask) in masks.iter_mut().enumerate() {
+                    if valid.value(row) {
+                        *mask |= 1 << field;
+                    }
+                }
+            }
+            self.0.extend(masks);
+            Ok(())
+        }
+
+        fn finish(self) -> VortexResult<Option<(Vec<Vec<u64>>, ())>> {
+            Ok(Some((vec![self.0], ())))
+        }
+
+        fn buffered_bytes(&self) -> u64 {
+            self.0.len() as u64 * 8
+        }
+    }
+}

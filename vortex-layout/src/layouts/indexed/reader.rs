@@ -17,15 +17,26 @@ use futures::future::try_join_all;
 use itertools::Itertools;
 use roaring::RoaringBitmap;
 use tracing::trace;
+use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
 use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::StructArray;
+use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
 use vortex_array::expr::BoundExpression;
+use vortex_array::expr::root;
+use vortex_array::expr::select;
+use vortex_array::scalar::Scalar;
+use vortex_array::scalar_fn::fns::get_item::GetItem;
+use vortex_array::scalar_fn::fns::select::Select;
 use vortex_buffer::BitBufferMut;
 use vortex_error::SharedVortexResult;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
+use vortex_mask::AllOr;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
@@ -67,6 +78,7 @@ pub struct IndexedReader {
     /// Cached claims keyed by expression. `None` means no index claimed the expression, so the
     /// lookup is not retried.
     claims: DashMap<BoundExpression, Option<Claims>>,
+    session: VortexSession,
 }
 
 /// The indexes that claimed one expression.
@@ -112,6 +124,7 @@ impl IndexedReader {
             lazy_children,
             indexes,
             claims: DashMap::default(),
+            session,
         })
     }
 
@@ -229,6 +242,18 @@ pub(crate) struct OpenArgs<'a> {
 pub(crate) trait OpenIndex: Send + Sync {
     /// This index's claim on `expr`, or `None` if its kind has none.
     fn claim(self: Arc<Self>, expr: &BoundExpression) -> VortexResult<Option<Claim>>;
+
+    /// Whether this index can narrow projections of the data child's struct.
+    fn narrows_projections(&self) -> bool;
+
+    /// Mark in `present` the struct fields non-null in any row `mask` selects over `row_range`
+    /// of the data child, or return false if any partition those rows fall in cannot tell.
+    fn mark_present_fields(
+        self: Arc<Self>,
+        row_range: Range<u64>,
+        mask: Mask,
+        present: BitBufferMut,
+    ) -> BoxFuture<'static, VortexResult<Option<BitBufferMut>>>;
 }
 
 /// Open a spec as a `V`, or `None` if its stored dtype is not what `V` now declares.
@@ -328,6 +353,67 @@ impl<V: IndexVTable> OpenIndex for TypedOpenIndex<V> {
             }),
             probes: DashMap::default(),
         }))
+    }
+
+    fn narrows_projections(&self) -> bool {
+        self.vtable.narrows_projections(&self.dtype, &self.options)
+    }
+
+    fn mark_present_fields(
+        self: Arc<Self>,
+        row_range: Range<u64>,
+        mask: Mask,
+        mut present: BitBufferMut,
+    ) -> BoxFuture<'static, VortexResult<Option<BitBufferMut>>> {
+        async move {
+            for partition in self.partitions.overlapping(&row_range) {
+                let rows = self.partitions.data_rows(partition);
+                let overlap = row_range.start.max(rows.start)..row_range.end.min(rows.end);
+                let selected = mask.slice(
+                    usize::try_from(overlap.start - row_range.start)?
+                        ..usize::try_from(overlap.end - row_range.start)?,
+                );
+                if selected.all_false() {
+                    continue;
+                }
+                if self.partitions.is_declined(partition) {
+                    return Ok(None);
+                }
+                let offset = u32::try_from(overlap.start - rows.start)?;
+                let local = match selected.indices() {
+                    AllOr::All => {
+                        RoaringBitmap::from_iter(offset..offset + u32::try_from(selected.len())?)
+                    }
+                    AllOr::None => continue,
+                    AllOr::Some(indices) => indices
+                        .iter()
+                        .map(|&i| u32::try_from(i).map(|i| offset + i))
+                        .collect::<Result<_, _>>()?,
+                };
+
+                let index_rows = self.partitions.index_rows(partition);
+                let mut chunks = Vec::new();
+                if !index_rows.is_empty() {
+                    let reader = self.index_reader()?;
+                    let bounds =
+                        SplitBy::Layout.splits(reader.as_ref(), &index_rows, &[FieldMask::All])?;
+                    for (start, end) in bounds.into_iter().tuple_windows() {
+                        chunks.push(self.chunk(start..end)?);
+                    }
+                }
+                let decoded = try_join_all(chunks).await?;
+                if !self.vtable.mark_present_fields(
+                    &decoded,
+                    &local,
+                    &self.options,
+                    &mut present,
+                )? {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(present))
+        }
+        .boxed()
     }
 }
 
@@ -655,7 +741,93 @@ impl LayoutReader for IndexedReader {
         expr: &BoundExpression,
         mask: MaskFuture,
     ) -> VortexResult<ArrayFuture> {
-        self.data_child()?
-            .projection_evaluation(row_range, expr, mask)
+        let data = Arc::clone(self.data_child()?);
+        let (DType::Struct(fields, _), true) = (self.dtype(), reads_whole_root(expr)) else {
+            return data.projection_evaluation(row_range, expr, mask);
+        };
+        let Some(index) = self
+            .indexes
+            .iter()
+            .find(|index| index.narrows_projections())
+            .map(Arc::clone)
+        else {
+            return data.projection_evaluation(row_range, expr, mask);
+        };
+
+        let dtype = self.dtype().clone();
+        let fields = fields.clone();
+        let row_range = row_range.clone();
+        let expr = expr.clone();
+        let session = self.session.clone();
+        Ok(async move {
+            let mask = mask.await?;
+            // Non-nullable fields are never absent, so a projection always reads them.
+            let mut always = BitBufferMut::new_unset(fields.nfields());
+            for (i, dtype) in fields.fields().enumerate() {
+                if !dtype.is_nullable() {
+                    always.set(i);
+                }
+            }
+            let present = if mask.all_false() {
+                None
+            } else {
+                index
+                    .mark_present_fields(row_range.clone(), mask.clone(), always)
+                    .await?
+                    .map(BitBufferMut::freeze)
+                    .filter(|present| present.true_count() < fields.nfields())
+            };
+            let Some(present) = present else {
+                return data
+                    .projection_evaluation(&row_range, &expr, MaskFuture::ready(mask))?
+                    .await;
+            };
+
+            let names = present
+                .set_indices()
+                .map(|i| fields.names()[i].clone())
+                .collect::<Vec<_>>();
+            let len = mask.true_count();
+            let selected = data
+                .projection_evaluation(
+                    &row_range,
+                    &select(names, root()).bind(&dtype)?,
+                    MaskFuture::ready(mask),
+                )?
+                .await?
+                .execute::<StructArray>(&mut session.create_execution_ctx())?;
+            let mut read = selected.iter_unmasked_fields();
+            let columns = fields
+                .fields()
+                .enumerate()
+                .map(|(i, dtype)| {
+                    if present.value(i) {
+                        read.next()
+                            .cloned()
+                            .ok_or_else(|| vortex_err!("Narrowed projection lost a field"))
+                    } else {
+                        Ok(ConstantArray::new(Scalar::null(dtype), len).into_array())
+                    }
+                })
+                .collect::<VortexResult<Vec<_>>>()?;
+            let narrowed =
+                StructArray::try_new_with_dtype(columns, fields, len, selected.struct_validity())?
+                    .into_array();
+            if expr.is_root() {
+                Ok(narrowed)
+            } else {
+                narrowed.apply_bound(&expr)
+            }
+        }
+        .boxed())
     }
+}
+
+/// Whether `expr` reads its whole scope struct somewhere, rather than only through `get_item` or
+/// `select`, which already read just the fields they name.
+fn reads_whole_root(expr: &BoundExpression) -> bool {
+    expr.is_root()
+        || (!expr.is::<GetItem>()
+            && !expr.is::<Select>()
+            && expr.children().iter().any(reads_whole_root))
 }

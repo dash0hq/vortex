@@ -147,6 +147,27 @@ pub trait IndexVTable: 'static + Send + Sync + Debug {
         options: &Self::Options,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<RowLocator>;
+
+    /// Whether [`mark_present_fields`](Self::mark_present_fields) can narrow a projection of the
+    /// struct `dtype`. When false, projections never load this index.
+    fn narrows_projections(&self, _dtype: &DType, _options: &Self::Options) -> bool {
+        false
+    }
+
+    /// Set the bit of every field of the data child's struct that is non-null in any of `rows`,
+    /// local to one partition, from all of that partition's decoded chunks. A projection of those
+    /// rows reads only the marked fields and fills the rest with nulls.
+    ///
+    /// Returns false when this partition cannot tell, so the projection reads every field.
+    fn mark_present_fields(
+        &self,
+        _chunks: &[Arc<Self::Chunk>],
+        _rows: &RoaringBitmap,
+        _options: &Self::Options,
+        _present: &mut BitBufferMut,
+    ) -> VortexResult<bool> {
+        Ok(false)
+    }
 }
 
 /// Shared handle to a registered index kind, erasing its [`IndexVTable`] types.
