@@ -1179,6 +1179,29 @@ fn test_expr_from_df_array_length(test_schema: Schema) -> DFResult<()> {
     ),
     false
 )]
+#[case::ree_dict_utf8(
+    DataType::RunEndEncoded(
+        Arc::new(Field::new("run_ends", DataType::Int32, false)),
+        Arc::new(Field::new(
+            "values",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true
+        ))
+    ),
+    true
+)]
+// Arrow's comparison kernels only unwrap run-end encoding as the outermost layer.
+#[case::ree_of_ree(
+    DataType::RunEndEncoded(
+        Arc::new(Field::new("run_ends", DataType::Int32, false)),
+        Arc::new(Field::new("values", ree_utf8(DataType::Int32), true))
+    ),
+    false
+)]
+#[case::dict_of_ree(
+    DataType::Dictionary(Box::new(DataType::UInt32), Box::new(ree_utf8(DataType::Int32))),
+    false
+)]
 fn test_supported_data_types(#[case] data_type: DataType, #[case] expected: bool) {
     assert_eq!(supported_data_types(&data_type), expected);
 }
@@ -2197,9 +2220,9 @@ fn test_ree_dict_comparison_matches_datafusion(#[case] predicate: &str) -> anyho
     assert_native_matches(plan_predicate(predicate, &schema)?, batch)
 }
 
-/// Comparisons on dictionary and run-end encoded columns match DataFusion for each value type that
-/// `supported_data_types` accepts, so the encoding never changes which rows a filter keeps.
-/// Add a value type here when `supported_data_types` starts to accept it.
+/// Filters on plain, dictionary and run-end encoded columns of these value types evaluate the same
+/// in Vortex as in DataFusion. Add a value type here when `supported_data_types` starts to accept
+/// it.
 #[rstest]
 fn test_encoded_comparison_matches_datafusion(
     #[values(
@@ -2239,16 +2262,21 @@ fn test_encoded_comparison_matches_datafusion(
         return Ok(());
     }
     let distinct = if value_type.is_string() || value_type.is_binary() {
-        cast(&StringArray::from(vec!["x", "y", "unused"]), &value_type)?
+        cast(
+            &StringArray::from(vec!["x", "y", "unused", "other"]),
+            &value_type,
+        )?
     } else {
-        let ints = Int64Array::from(vec![0, 1, 2]);
+        let ints = Int64Array::from(vec![0, 1, 2, 3]);
         cast(&ints, &value_type).or_else(|_| cast(&cast(&ints, &DataType::Int32)?, &value_type))?
     };
-    // Rows: v0, v0, NULL, v1, v1, v0. The dictionary also holds a value no key references.
+    // Rows: v0, v0, NULL, v1, v1, v0. The dictionary also holds values no key references.
     let dictionary = DictionaryArray::<UInt32Type>::try_new(
         UInt32Array::from(vec![Some(0), Some(0), None, Some(1), Some(1), Some(0)]),
         distinct,
     )?;
+    let unused = ScalarValue::try_from_array(dictionary.values(), 2)?;
+    let other = ScalarValue::try_from_array(dictionary.values(), 3)?;
     let plain = cast(&dictionary, &value_type)?;
     let run_ends = |run_ends: DataType| {
         cast(
@@ -2286,9 +2314,6 @@ fn test_encoded_comparison_matches_datafusion(
         column().gt(literal(&first)),
         column().gt_eq(literal(&second)),
         literal(&first).lt(column()),
-        column().in_list(vec![literal(&second)], false),
-        column().in_list(vec![literal(&first), literal(&second)], false),
-        column().in_list(vec![literal(&first), literal(&second)], true),
         column()
             .eq(literal(&first))
             .and(column().not_eq(literal(&second))),
@@ -2296,7 +2321,30 @@ fn test_encoded_comparison_matches_datafusion(
             .eq(literal(&first))
             .or(column().eq(literal(&second))),
     ] {
-        assert_native_matches(plan_expr(predicate, &schema)?, batch.clone())?;
+        let expr = plan_expr(predicate, &schema)?;
+        expr.evaluate(&batch)?;
+        assert_native_matches(expr, batch.clone())?;
+    }
+
+    // DataFusion rewrites a column IN list of up to three values into comparisons.
+    let null = ScalarValue::try_from(&value_type)?;
+    for last in [&second, &null] {
+        for negated in [false, true] {
+            let list = [&first, &unused, &other, last].map(literal).to_vec();
+            let expr = plan_expr(column().in_list(list, negated), &schema)?;
+            assert!(
+                expr.downcast_ref::<df_expr::InListExpr>().is_some(),
+                "{expr}"
+            );
+            expr.evaluate(&batch)?;
+            if last.is_null() && encoding.starts_with("ree") {
+                let converted = DefaultExpressionConverter::new(VortexSession::default())
+                    .try_convert(&expr, &schema)?;
+                assert!(converted.is_none(), "{expr} should stay in DataFusion");
+            } else {
+                assert_native_matches(expr, batch.clone())?;
+            }
+        }
     }
     Ok(())
 }
