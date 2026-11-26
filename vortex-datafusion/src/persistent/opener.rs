@@ -19,7 +19,6 @@ use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file_stream::FileOpenFuture;
 use datafusion_datasource::file_stream::FileOpener;
-use datafusion_execution::cache::cache_manager::CachedFileMetadataEntry;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_physical_expr::DynamicFilterTracking;
 use datafusion_physical_expr::PhysicalExprRef;
@@ -77,7 +76,8 @@ use crate::convert::schema::calculate_physical_schema;
 use crate::convert::to_record_batch;
 use crate::metrics::PARTITION_LABEL;
 use crate::metrics::PATH_LABEL;
-use crate::persistent::cache::CachedVortexMetadata;
+use crate::persistent::cache::cache_footer;
+use crate::persistent::cache::cached_footer;
 use crate::persistent::reader::VortexReaderFactory;
 use crate::persistent::stream::PrunableStream;
 use crate::v2::dynamic_filters::convert_dynamic_filter;
@@ -287,15 +287,7 @@ impl FileOpener for VortexOpener {
 
             let cached_footer = file_metadata_cache
                 .as_ref()
-                .and_then(|cache| cache.get(file.path()))
-                .filter(|entry| entry.is_valid_for(&file.object_meta))
-                .and_then(|entry| {
-                    entry
-                        .file_metadata
-                        .as_any()
-                        .downcast_ref::<CachedVortexMetadata>()
-                        .map(|vortex_metadata| vortex_metadata.footer().clone())
-                });
+                .and_then(|cache| cached_footer(cache.as_ref(), &file.object_meta));
             let footer_cache_hit = cached_footer.is_some();
 
             if let Some(footer) = cached_footer {
@@ -311,13 +303,7 @@ impl FileOpener for VortexOpener {
             // skip the footer fetch and parse. `infer_schema`/`infer_stats` also populate
             // this cache, but only when planning goes through `VortexFormat`.
             if !footer_cache_hit && let Some(cache) = &file_metadata_cache {
-                cache.put(
-                    file.path(),
-                    CachedFileMetadataEntry::new(
-                        file.object_meta.clone(),
-                        Arc::new(CachedVortexMetadata::new(&vxf)),
-                    ),
-                );
+                cache_footer(cache.as_ref(), &file.object_meta, &vxf);
             }
 
             // Check if there are rows in this file. If not, we can save
@@ -879,6 +865,7 @@ mod tests {
     use datafusion_datasource::file::FileSource;
     use datafusion_datasource::file_groups::FileGroup;
     use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+    use datafusion_execution::cache::cache_manager::CachedFileMetadataEntry;
     use datafusion_execution::cache::default_cache::DefaultCache;
     use datafusion_execution::object_store::ObjectStoreUrl;
     use datafusion_expr::Operator;
@@ -1556,17 +1543,9 @@ mod tests {
         let first = stream.try_collect::<Vec<_>>().await?;
         assert_eq!(concat_batches(&batch.schema(), &first)?, batch);
 
-        let entry = cache
-            .get(file.path())
+        let footer = cached_footer(cache.as_ref(), &file.object_meta)
             .ok_or_else(|| anyhow::anyhow!("footer was not cached after open"))?;
-        assert!(entry.is_valid_for(&file.object_meta));
-        assert!(
-            entry
-                .file_metadata
-                .as_any()
-                .downcast_ref::<CachedVortexMetadata>()
-                .is_some()
-        );
+        assert_eq!(footer.row_count(), 3);
 
         // The second open hits the cache and still returns the same data.
         let stream = opener.open(file.clone())?.await?;
