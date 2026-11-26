@@ -34,7 +34,6 @@ use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_execution::cache::cache_manager::CachedFileMetadataEntry;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_plan::ExecutionPlan;
@@ -68,7 +67,8 @@ use vortex::scalar::ScalarValue as VortexScalarValue;
 use vortex::session::VortexSession;
 use vortex_arrow::ArrowSessionExt;
 
-use super::cache::CachedVortexMetadata;
+use super::cache::cache_footer;
+use super::cache::cached_footer;
 use super::sink::VortexSink;
 use super::source::VortexSource;
 use crate::PrecisionExt as _;
@@ -520,16 +520,8 @@ impl FileFormat for VortexFormat {
 
                 SpawnedTask::spawn(async move {
                     // Check if we have entry metadata for this file
-                    if let Some(entry) = cache.get(&object.location)
-                        && entry.is_valid_for(&object)
-                        && let Some(cached_vortex) = entry
-                            .file_metadata
-                            .as_any()
-                            .downcast_ref::<CachedVortexMetadata>()
-                    {
-                        let inferred_schema = session
-                            .arrow()
-                            .to_arrow_schema(cached_vortex.footer().dtype())?;
+                    if let Some(footer) = cached_footer(cache.as_ref(), &object) {
+                        let inferred_schema = session.arrow().to_arrow_schema(footer.dtype())?;
                         return VortexResult::Ok((object.location, inferred_schema));
                     }
 
@@ -549,9 +541,7 @@ impl FileFormat for VortexFormat {
                         .await?;
 
                     // Cache the metadata
-                    let cached_metadata = Arc::new(CachedVortexMetadata::new(&vxf));
-                    let entry = CachedFileMetadataEntry::new(object.clone(), cached_metadata);
-                    cache.put(&object.location, entry);
+                    cache_footer(cache.as_ref(), &object, &vxf);
 
                     let inferred_schema = session.arrow().to_arrow_schema(vxf.dtype())?;
                     VortexResult::Ok((object.location, inferred_schema))
@@ -592,21 +582,13 @@ impl FileFormat for VortexFormat {
 
         SpawnedTask::spawn(async move {
             // Try to get entry metadata first
-            let cached_metadata = file_metadata_cache
-                .get(&object.location)
-                .filter(|entry| entry.is_valid_for(&object))
-                .and_then(|entry| {
-                    entry
-                        .file_metadata
-                        .as_any()
-                        .downcast_ref::<CachedVortexMetadata>()
-                        .map(|m| {
-                            (
-                                m.footer().dtype().clone(),
-                                m.footer().statistics().cloned(),
-                                m.footer().row_count(),
-                            )
-                        })
+            let cached_metadata =
+                cached_footer(file_metadata_cache.as_ref(), &object).map(|footer| {
+                    (
+                        footer.dtype().clone(),
+                        footer.statistics().cloned(),
+                        footer.row_count(),
+                    )
                 });
 
             let (_dtype, file_stats, row_count) = match cached_metadata {
@@ -634,9 +616,7 @@ impl FileFormat for VortexFormat {
                         })?;
 
                     // Cache the metadata
-                    let file_metadata = Arc::new(CachedVortexMetadata::new(&vxf));
-                    let entry = CachedFileMetadataEntry::new(object.clone(), file_metadata);
-                    file_metadata_cache.put(&object.location, entry);
+                    cache_footer(file_metadata_cache.as_ref(), &object, &vxf);
 
                     (
                         vxf.dtype().clone(),

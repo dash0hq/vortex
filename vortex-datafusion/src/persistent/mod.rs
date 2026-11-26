@@ -33,6 +33,8 @@ mod source;
 mod stream;
 
 pub use access_plan::VortexAccessPlan;
+pub use cache::cache_footer;
+pub use cache::cached_footer;
 pub use format::VortexFormat;
 pub use format::VortexFormatFactory;
 pub use format::VortexTableOptions;
